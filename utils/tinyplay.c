@@ -39,6 +39,7 @@ struct cmd {
     unsigned int card;
     unsigned int device;
     int flags;
+    int anonfd;
     struct pcm_config config;
     unsigned int bits;
 };
@@ -50,6 +51,7 @@ void cmd_init(struct cmd *cmd)
     cmd->card = 0;
     cmd->device = 0;
     cmd->flags = PCM_OUT;
+    cmd->anonfd = 0;
     cmd->config.period_size = 1024;
     cmd->config.period_count = 2;
     cmd->config.channels = 2;
@@ -69,6 +71,11 @@ int cmd_parse_arg(struct cmd *cmd, int argc, const char **argv)
 
     if ((strcmp(argv[0], "-M") == 0) || (strcmp(argv[0], "--mmap") == 0)) {
         cmd->flags |= PCM_MMAP;
+        return 1;
+    }
+
+    if ((strcmp(argv[0], "-A") == 0) || (strcmp(argv[0], "--anonfd") == 0)) {
+        cmd->anonfd = 1;
         return 1;
     }
 
@@ -273,10 +280,13 @@ int ctx_init(struct ctx* ctx, const struct cmd *cmd)
     return 0;
 }
 
-void ctx_free(struct ctx *ctx)
+void ctx_free(struct ctx *ctx, struct pcm *pcm)
 {
     if (ctx == NULL) {
         return;
+    }
+    if (ctx->pcm != pcm && pcm) {
+        pcm_close(pcm);
     }
     if (ctx->pcm != NULL) {
         pcm_close(ctx->pcm);
@@ -288,7 +298,7 @@ void ctx_free(struct ctx *ctx)
 
 static int close = 0;
 
-int play_sample(struct ctx *ctx, const struct cmd *cmd);
+int play_sample(struct ctx *ctx, struct pcm *pcm, const struct cmd *cmd);
 
 void stream_close(int sig)
 {
@@ -310,12 +320,14 @@ void print_usage(const char *argv0)
     fprintf(stderr, "-r | --rate <rate>             The amount of frames per second\n");
     fprintf(stderr, "-b | --bits <bit-count>        The number of bits in one sample\n");
     fprintf(stderr, "-M | --mmap                    Use memory mapped IO to play audio\n");
+    fprintf(stderr, "-A | --anonfd                  Use anonymous file descriptor\n");
 }
 
 int main(int argc, const char **argv)
 {
     struct cmd cmd;
     struct ctx ctx;
+    struct pcm *pcm;
 
     if (argc < 2) {
         print_usage(argv[0]);
@@ -331,6 +343,25 @@ int main(int argc, const char **argv)
         return EXIT_FAILURE;
     }
 
+    pcm = ctx.pcm;
+
+    if (cmd.anonfd) {
+        const struct pcm_config *config = pcm_get_config(ctx.pcm);
+        int fd = pcm_get_anonymous_fd(ctx.pcm, PCM_PERM_FULL);
+        if (fd < 0) {
+           fprintf(stderr, "failed to create anonymous fd\n");
+           goto failure;
+        }
+        pcm = pcm_open_by_fd(fd, cmd.flags | PCM_SKIP_CONFIG, config);
+        if (pcm == NULL) {
+           fprintf(stderr, "failed to allocate memory for anonymous pcm\n");
+           goto failure;
+        } else if (!pcm_is_ready(pcm)) {
+           fprintf(stderr, "failed to open anonymous pcm\n");
+           goto failure;
+        }
+    }
+        
     /* TODO get parameters from context */
     printf("playing '%s': %u ch, %u hz, %u bit\n",
            cmd.filename,
@@ -338,12 +369,13 @@ int main(int argc, const char **argv)
            cmd.config.rate,
            cmd.bits);
 
-    if (play_sample(&ctx, &cmd) < 0) {
-        ctx_free(&ctx);
+    if (play_sample(&ctx, pcm, &cmd) < 0) {
+failure:
+        ctx_free(&ctx, pcm);
         return EXIT_FAILURE;
     }
 
-    ctx_free(&ctx);
+    ctx_free(&ctx, pcm);
     return EXIT_SUCCESS;
 }
 
@@ -393,14 +425,14 @@ int sample_is_playable(const struct cmd *cmd)
     return can_play;
 }
 
-int play_sample(struct ctx *ctx, const struct cmd *cmd)
+int play_sample(struct ctx *ctx, struct pcm *pcm, const struct cmd *cmd)
 {
     char *buffer;
     int size;
     int num_read;
     int ret;
 
-    size = pcm_frames_to_bytes(ctx->pcm, pcm_get_buffer_size(ctx->pcm));
+    size = pcm_frames_to_bytes(pcm, pcm_get_buffer_size(pcm));
     buffer = malloc(size);
     if (!buffer) {
         fprintf(stderr, "unable to allocate %d bytes\n", size);
@@ -414,10 +446,10 @@ int play_sample(struct ctx *ctx, const struct cmd *cmd)
         num_read = fread(buffer, 1, size, ctx->file);
         if (num_read > 0) {
             if (cmd->flags & PCM_MMAP)
-                ret = pcm_mmap_write(ctx->pcm, buffer, num_read);
+                ret = pcm_mmap_write(pcm, buffer, num_read);
             else
-                ret = pcm_writei(ctx->pcm, buffer,
-                                 pcm_bytes_to_frames(ctx->pcm, num_read));
+                ret = pcm_writei(pcm, buffer,
+                                 pcm_bytes_to_frames(pcm, num_read));
             if (ret < 0) {
                 fprintf(stderr, "error playing sample\n");
                 break;
