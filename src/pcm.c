@@ -329,33 +329,14 @@ const char* pcm_get_error(const struct pcm *pcm)
     return pcm->error;
 }
 
-/** Sets the PCM configuration.
- * @param pcm A PCM handle.
- * @param config The configuration to use for the
- *  PCM. This parameter may be NULL, in which case
- *  the default configuration is used.
- * @returns Zero on success, a negative errno value
- *  on failure.
- * @ingroup libtinyalsa-pcm
- * */
-int pcm_set_config(struct pcm *pcm, const struct pcm_config *config)
+/**
+ *
+ */
+static int pcm_set_hw_params(struct pcm *pcm)
 {
-    if (pcm == NULL)
-        return -EFAULT;
-    else if (config == NULL) {
-        config = &pcm->config;
-        pcm->config.channels = 2;
-        pcm->config.rate = 48000;
-        pcm->config.period_size = 1024;
-        pcm->config.period_count = 4;
-        pcm->config.format = PCM_FORMAT_S16_LE;
-        pcm->config.start_threshold = config->period_count * config->period_size;
-        pcm->config.stop_threshold = config->period_count * config->period_size;
-        pcm->config.silence_threshold = 0;
-    } else
-        pcm->config = *config;
-
+    struct pcm_config *config = &pcm->config;
     struct snd_pcm_hw_params params;
+
     param_init(&params);
     param_set_mask(&params, SNDRV_PCM_HW_PARAM_FORMAT,
                    pcm_format_to_alsa(config->format));
@@ -398,21 +379,16 @@ int pcm_set_config(struct pcm *pcm, const struct pcm_config *config)
     /* get our refined hw_params */
     pcm->config.period_size = param_get_int(&params, SNDRV_PCM_HW_PARAM_PERIOD_SIZE);
     pcm->config.period_count = param_get_int(&params, SNDRV_PCM_HW_PARAM_PERIODS);
-    pcm->buffer_size = config->period_count * config->period_size;
+    return 0;
+}
 
-    if (pcm->flags & PCM_MMAP) {
-        pcm->mmap_buffer = mmap(NULL, pcm_frames_to_bytes(pcm, pcm->buffer_size),
-                                PROT_READ | PROT_WRITE, MAP_FILE | MAP_SHARED, pcm->fd, 0);
-        if (pcm->mmap_buffer == MAP_FAILED) {
-            int errno_copy = errno;
-            oops(pcm, -errno, "failed to mmap buffer %d bytes\n",
-                 pcm_frames_to_bytes(pcm, pcm->buffer_size));
-            return -errno_copy;
-        }
-    }
-
+static int pcm_set_sw_params(struct pcm *pcm)
+{
+    struct pcm_config *config = &pcm->config;
     struct snd_pcm_sw_params sparams;
+
     memset(&sparams, 0, sizeof(sparams));
+
     sparams.tstamp_mode = SNDRV_PCM_TSTAMP_ENABLE;
     sparams.period_step = 1;
     sparams.avail_min = 1;
@@ -450,6 +426,62 @@ int pcm_set_config(struct pcm *pcm, const struct pcm_config *config)
         int errno_copy = errno;
         oops(pcm, -errno, "cannot set sw params");
         return -errno_copy;
+    }
+    return 0;
+}
+
+/** Sets the PCM configuration.
+ * @param pcm A PCM handle.
+ * @param config The configuration to use for the
+ *  PCM. This parameter may be NULL, in which case
+ *  the default configuration is used.
+ * @returns Zero on success, a negative errno value
+ *  on failure.
+ * @ingroup libtinyalsa-pcm
+ * */
+int pcm_set_config(struct pcm *pcm, const struct pcm_config *config)
+{
+    int rc;
+
+    if (pcm == NULL)
+        return -EFAULT;
+    else if (config == NULL) {
+        config = &pcm->config;
+        pcm->config.channels = 2;
+        pcm->config.rate = 48000;
+        pcm->config.period_size = 1024;
+        pcm->config.period_count = 4;
+        pcm->config.format = PCM_FORMAT_S16_LE;
+        pcm->config.start_threshold = config->period_count * config->period_size;
+        pcm->config.stop_threshold = config->period_count * config->period_size;
+        pcm->config.silence_threshold = 0;
+    } else
+        pcm->config = *config;
+
+    if (!(pcm->flags & PCM_SKIP_CONFIG)) {
+        rc = pcm_set_hw_params(pcm);
+        if (rc < 0)
+            return rc;
+    }
+
+    /* get our refined hw_params */
+    pcm->buffer_size = config->period_count * config->period_size;
+
+    if (pcm->flags & PCM_MMAP) {
+        pcm->mmap_buffer = mmap(NULL, pcm_frames_to_bytes(pcm, pcm->buffer_size),
+                                PROT_READ | PROT_WRITE, MAP_FILE | MAP_SHARED, pcm->fd, 0);
+        if (pcm->mmap_buffer == MAP_FAILED) {
+            int errno_copy = errno;
+            oops(pcm, -errno, "failed to mmap buffer %d bytes\n",
+                 pcm_frames_to_bytes(pcm, pcm->buffer_size));
+            return -errno_copy;
+        }
+    }
+
+    if (!(pcm->flags & PCM_SKIP_CONFIG)) {
+        rc = pcm_set_sw_params(pcm);
+        if (rc < 0)
+            return rc;
     }
 
     return 0;
@@ -588,6 +620,17 @@ static void pcm_hw_munmap_status(struct pcm *pcm) {
 static struct pcm bad_pcm = {
     .fd = -1,
 };
+
+static struct pcm *pcm_alloc(int fd, unsigned int flags)
+{
+    struct pcm *pcm = calloc(1, sizeof(struct pcm));
+    if (!pcm) {
+        return NULL;
+    }
+    pcm->fd = fd;
+    pcm->flags = flags;
+    return pcm;
+}
 
 /** Gets the hardware parameters of a PCM, without created a PCM handle.
  * @param card The card of the PCM.
@@ -856,30 +899,55 @@ struct pcm *pcm_open(unsigned int card, unsigned int device,
                      unsigned int flags, const struct pcm_config *config)
 {
     struct pcm *pcm;
-    struct snd_pcm_info info;
     char fn[256];
-    int rc;
-
-    pcm = calloc(1, sizeof(struct pcm));
-    if (!pcm)
-        return &bad_pcm;
+    int fd;
 
     snprintf(fn, sizeof(fn), "/dev/snd/pcmC%uD%u%c", card, device,
              flags & PCM_IN ? 'c' : 'p');
 
-    pcm->flags = flags;
+    fd = open(fn, O_RDWR | ((flags & PCM_NONBLOCK) ? O_NONBLOCK : 0));
 
-    if (flags & PCM_NONBLOCK)
-        pcm->fd = open(fn, O_RDWR | O_NONBLOCK);
-    else
-        pcm->fd = open(fn, O_RDWR);
-
-    if (pcm->fd < 0) {
+    if (fd < 0) {
+        pcm = pcm_alloc(-1, flags);
+        if (pcm == NULL)
+            pcm = &bad_pcm;
         oops(pcm, errno, "cannot open device '%s'", fn);
         return pcm;
     }
 
-    if (ioctl(pcm->fd, SNDRV_PCM_IOCTL_INFO, &info)) {
+    return pcm_open_by_fd(fd, flags, config);
+}
+
+/** Opens a PCM using a file descriptor (like anonymous).
+ * @param fd The ALSA PCM file descriptor.
+ * @param flags Specify characteristics and functionality about the pcm.
+ *  May be a bitwise AND of the following:
+ *   - @ref PCM_IN
+ *   - @ref PCM_OUT
+ *   - @ref PCM_MMAP
+ *   - @ref PCM_NOIRQ
+ *   - @ref PCM_MONOTONIC
+ * @param config The hardware and software parameters to open the PCM with.
+ * @returns A PCM structure.
+ *  If an error occurs allocating memory for the PCM, NULL is returned.
+ *  Otherwise, client code should check that the PCM opened properly by calling @ref pcm_is_ready.
+ *  If @ref pcm_is_ready, check @ref pcm_get_error for more information.
+ * @ingroup libtinyalsa-pcm
+ */
+struct pcm *pcm_open_by_fd(int fd, unsigned int flags,
+                           const struct pcm_config *config)
+{
+    struct pcm *pcm;
+    struct snd_pcm_info info;
+    int rc;
+
+    pcm = pcm_alloc(fd, flags);
+    if (!pcm) {
+        close(fd);
+        return &bad_pcm;
+    }
+
+    if (ioctl(fd, SNDRV_PCM_IOCTL_INFO, &info)) {
         oops(pcm, errno, "cannot get info");
         goto fail_close;
     }
@@ -897,7 +965,7 @@ struct pcm *pcm_open(unsigned int card, unsigned int device,
 #ifdef SNDRV_PCM_IOCTL_TTSTAMP
     if (pcm->flags & PCM_MONOTONIC) {
         int arg = SNDRV_PCM_TSTAMP_TYPE_MONOTONIC;
-        rc = ioctl(pcm->fd, SNDRV_PCM_IOCTL_TTSTAMP, &arg);
+        rc = ioctl(fd, SNDRV_PCM_IOCTL_TTSTAMP, &arg);
         if (rc < 0) {
             oops(pcm, rc, "cannot set timestamp type");
             goto fail;
@@ -905,9 +973,11 @@ struct pcm *pcm_open(unsigned int card, unsigned int device,
     }
 #endif
 
-    /* prepare here so the user does not need to do this later */
-    if (pcm_prepare(pcm))
-        goto fail;
+    if (!(pcm->flags & PCM_SKIP_CONFIG)) {
+        /* prepare here so the user does not need to do this later */
+        if (pcm_prepare(pcm))
+            goto fail;
+    }
 
     pcm->xruns = 0;
     return pcm;
@@ -917,7 +987,7 @@ fail:
     if (flags & PCM_MMAP)
         munmap(pcm->mmap_buffer, pcm_frames_to_bytes(pcm, pcm->buffer_size));
 fail_close:
-    close(pcm->fd);
+    close(fd);
     pcm->fd = -1;
     return pcm;
 }
@@ -1507,3 +1577,19 @@ long pcm_get_delay(struct pcm *pcm)
     return pcm->pcm_delay;
 }
 
+/** Obtain anonymous ALSA PCM file descriptor.
+ * @param pcm A PCM handle.
+ * @param perm Requested permissions
+ * @returns Positive file descriptor value on success,
+ *          a negative errno value on failure.
+ * @ingroup libtinyalsa-pcm
+ */
+int pcm_get_anonymous_fd(struct pcm *pcm, int perm)
+{
+    int fd = perm;
+
+    if (ioctl(pcm->fd, SNDRV_PCM_IOCTL_ANONYMOUS_DUP, &fd))
+        return -1;
+
+    return fd;
+}

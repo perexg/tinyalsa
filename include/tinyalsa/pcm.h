@@ -95,6 +95,11 @@
  * */
 #define PCM_NONBLOCK 0x00000010
 
+/** If used with @ref pcm_open
+ * it will skip the PCM configuration.
+ * */
+#define PCM_SKIP_CONFIG 0x00000020
+
 /** Means a PCM is prepared
  * @ingroup libtinyalsa-pcm
  */
@@ -125,6 +130,16 @@
  * @ingroup libtinyalsa-pcm
  */
 #define PCM_STATE_DISCONNECTED 0x08
+
+/** Permissions for the anonymous file descriptor. Full access.
+ * @ingroup libtinyalsa-pcm
+ */
+#define PCM_PERM_FULL 0
+
+/** Permissions for the anonymous file descriptor. Allow mmap buffer only.
+ * @ingroup libtinyalsa-pcm
+ */
+#define PCM_PERM_BUFFER 1
 
 #if defined(__cplusplus)
 extern "C" {
@@ -252,6 +267,10 @@ struct pcm *pcm_open(unsigned int card,
                      unsigned int flags,
                      const struct pcm_config *config);
 
+struct pcm *pcm_open_by_fd(int fd,
+                           unsigned int flags,
+                           const struct pcm_config *config);
+
 struct pcm *pcm_open_by_name(const char *name,
                              unsigned int flags,
                              const struct pcm_config *config);
@@ -315,6 +334,8 @@ int pcm_stop(struct pcm *pcm);
 int pcm_wait(struct pcm *pcm, int timeout);
 
 long pcm_get_delay(struct pcm *pcm);
+
+int pcm_get_anonymous_fd(struct pcm *pcm, int perm);
 
 #if defined(__cplusplus)
 }  /* extern "C" */
